@@ -220,6 +220,15 @@ the anchor's back-office plumbing, not the engine — but it means **the
 the engine's timeout/recovery path is what actually ran. Closing that is the
 remaining Phase-1 item.
 
+**Update (2026-09-01): cursor seeding fixed in #65.** `reference-anchor.sh up`
+now reseeds the observer cursor from Horizon's tip on every start (see [the
+observer cursor](./docs/operations.md#the-observer-cursor)), #66 added a
+cursor-lag check to `doctor`, and #67/#75 added `pnpm verify:corridor` plus the
+scheduled [`reference-corridor`](https://github.com/ezedike-evan/corridor-in-a-box/actions/workflows/reference-corridor.yml)
+workflow, which runs the whole corridor against the reference stack. The stale
+cursor is no longer the known blocker. `reconcile → completed` stays **unproven**
+until that workflow passes; it currently fails.
+
 ## Proof the settle leg is real
 
 The settle leg has been executed against live Stellar testnet. Reproduce it in

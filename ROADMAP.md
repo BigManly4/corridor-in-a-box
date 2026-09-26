@@ -27,6 +27,12 @@ system. Items marked ✅ are done.
   stale cursor, never matched the payment, and left the transaction at
   `pending_sender`. The engine's timeout/recovery path is what ran. **This leg
   remains unproven end to end** and is the last open Phase-1 item.
+  _Update (2026-09-01):_ cursor seeding fixed in #65 — `reference-anchor.sh up`
+  reseeds the observer cursor from Horizon's tip, #66 added `doctor`'s
+  cursor-lag check, and #67/#75 added `pnpm verify:corridor` and the scheduled
+  [`reference-corridor`](https://github.com/ezedike-evan/corridor-in-a-box/actions/workflows/reference-corridor.yml)
+  workflow. The pending proof is that workflow going green; it currently fails,
+  so this item stays ⬜.
 
 ## Phase 2 — Durability & correctness
 
