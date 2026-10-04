@@ -16,9 +16,15 @@ export {
   type QueryResult,
 } from "./idempotency-pg";
 export {
+  PostgresCorridorHealthStore,
+  type CorridorHealthStore,
+  type HealthState,
+} from "./health-pg";
+export {
   UnimplementedSubmitter,
   createMockSubmitter,
   type SettlementSubmitter,
+  type ChainVerifier,
   type SettlementRef,
   type SettlementRequest,
   type RefundRequest,
@@ -28,12 +34,17 @@ export {
   comply,
   open,
   settle,
+  buildSettlementRequest,
+  settleQuoteProblem,
   reconcile,
   reconcileUntil,
+  watchRefund,
+  anchorTerminalStatus,
   backoffMs,
   recover,
   type RecoveryAction,
   type PollOptions,
+  type RefundPollOptions,
 } from "./verbs";
 export {
   consoleLogger,
@@ -47,6 +58,7 @@ export {
   type LogFields,
   type AuditSink,
   type AuditEntry,
+  type AuditDetail,
   type Metrics,
   type MetricTags,
 } from "./observability";
@@ -57,3 +69,4 @@ export {
   type GateContext,
   type PreSettleGate,
 } from "./gate";
+export { quoteWindowCheck } from "./quoteWindow";

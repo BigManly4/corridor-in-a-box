@@ -1,7 +1,9 @@
-// @corridor/stellar — the ONE place that touches the chain. It wraps
-// @stellar/stellar-sdk to (a) sign SEP-10 challenges and (b) submit the native
-// settle-leg payment. Everything else in the monorepo stays SDK-free; swap
-// createMockSubmitter() for StellarSettlementSubmitter to move real money.
+// @corridor/stellar — the only package on the money path that touches the
+// chain; probe/registry/attester read and write the conformance registry, never
+// move funds. It wraps @stellar/stellar-sdk to (a) sign SEP-10 challenges and
+// (b) submit the native settle-leg payment. The rest of the money path stays
+// SDK-free; swap createMockSubmitter() for StellarSettlementSubmitter to move
+// real money.
 //
 // SEP-31 settlement is a single NATIVE payment of the bridge asset to the
 // receiving anchor's deposit address — no smart contract involved.
@@ -19,8 +21,17 @@ import {
   TransactionFailedError,
   xdr,
 } from "@stellar/stellar-sdk";
-import { fail, fromScaled, ok, STROOP_SCALE, toScaled, type Outcome } from "@corridor/types";
+import {
+  compareAmounts,
+  fail,
+  fromScaled,
+  ok,
+  STROOP_SCALE,
+  toScaled,
+  type Outcome,
+} from "@corridor/types";
 import type {
+  ChainVerifier,
   CheckResult,
   GateCheck,
   GateContext,
@@ -126,7 +137,8 @@ export class StellarSep10Signer implements Sep10Signer {
 type HorizonServerLike = Pick<
   Horizon.Server,
   "loadAccount" | "submitTransaction" | "transactions"
->;
+> &
+  Partial<Pick<Horizon.Server, "payments">>;
 
 export interface StellarSubmitterOptions {
   /** Production: a KMS/HSM-backed signer that never exposes the seed. */
@@ -137,6 +149,8 @@ export interface StellarSubmitterOptions {
   horizonUrl: string;
   /** Test seam: inject a fake Horizon server instead of connecting for real. */
   horizonServer?: HorizonServerLike;
+  /** Optional account inspector for checking existing payments or balance. */
+  inspector?: AccountInspector;
   /** The settlement fee (in XLM decimal string). Defaults to StellarSettlementSubmitter.fee. */
   fee?: string;
   /** How long to keep polling Horizon for confirmation. Default 30s. */
@@ -162,6 +176,7 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
   readonly fee: string;
   private readonly signer: ExternalSigner;
   private readonly server: HorizonServerLike;
+  private readonly inspector: AccountInspector;
   private readonly confirmTimeoutMs: number;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -178,6 +193,12 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
     }
     this.signer = opts.signer ?? LocalKeypairSigner.fromSecret(opts.signerSecret as string);
     this.server = opts.horizonServer ?? new Horizon.Server(opts.horizonUrl);
+    this.inspector =
+      opts.inspector ??
+      new AccountInspector({
+        horizonServer: this.server,
+        horizonUrl: opts.horizonUrl,
+      });
     this.confirmTimeoutMs = opts.confirmTimeoutMs ?? 30_000;
     this.now = opts.now ?? (() => Date.now());
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -205,6 +226,13 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
   }
 
   async submit(req: SettlementRequest): Promise<Outcome<SettlementRef>> {
+    const now = this.now();
+    if (req.validUntil !== undefined && req.validUntil <= now) {
+      return fail("QUOTE_EXPIRED", `quote expired at ${req.validUntil} (now=${now})`, {
+        retryable: false,
+      });
+    }
+
     let hash: string | undefined;
     let submitAttempted = false;
     try {
@@ -217,6 +245,13 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
         const feeScaled = toScaled(this.fee, STROOP_SCALE);
         // this.fee was validated in the constructor.
         const feeStroops = feeScaled.ok ? feeScaled.value.toString() : BASE_FEE;
+        const nowSec = Math.floor(this.now() / 1000);
+        const ttlMaxTime = nowSec + req.corridor.fx.quote_ttl_seconds;
+        const maxTime =
+          req.validUntil !== undefined
+            ? Math.min(Math.floor(req.validUntil / 1000), ttlMaxTime)
+            : ttlMaxTime;
+
         const builder = new TransactionBuilder(source, {
           fee: feeStroops,
           networkPassphrase: passphrase,
@@ -225,14 +260,14 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
             Operation.payment({ destination: req.to, asset, amount: req.amount.amount }),
           )
           // Beat the firm-quote expiry: the tx must hit the ledger before the quote dies.
-          .setTimeout(req.corridor.fx.quote_ttl_seconds);
+          .setTimebounds(0, maxTime);
 
         if (req.memo) builder.addMemo(buildMemo(req.memo, req.memoType));
 
         const tx = builder.build();
         // Computed before submission: the one thing that lets us check "did
         // this actually land" if submitTransaction's own response is lost.
-        hash = tx.hash().toString("hex");
+        hash = Buffer.from(tx.hash()).toString("hex");
         await attachSignature(tx, this.signer);
 
         submitAttempted = true;
@@ -241,7 +276,11 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
 
       const confirmed = await this.confirm(hash as string);
       if (!confirmed.ok) return confirmed;
-      return ok<SettlementRef>({ stellarTxHash: hash as string, ledger: confirmed.value });
+      return ok<SettlementRef>({
+        stellarTxHash: hash as string,
+        ledger: confirmed.value.ledger,
+        feeCharged: confirmed.value.feeCharged,
+      });
     } catch (cause) {
       if (!submitAttempted || cause instanceof TransactionFailedError) {
         // Either nothing ever reached Horizon (build/sign/lock failure — always
@@ -260,13 +299,82 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
       // network blip becomes a double payment, so check before deciding.
       const landed = await this.confirm(hash as string);
       if (landed.ok) {
-        return ok<SettlementRef>({ stellarTxHash: hash as string, ledger: landed.value });
+        return ok<SettlementRef>({
+          stellarTxHash: hash as string,
+          ledger: landed.value.ledger,
+          feeCharged: landed.value.feeCharged,
+        });
       }
       return fail(
         landed.error.code,
         `settlement submit ambiguous for tx ${hash} (${describe(cause)}); ` +
           `confirm check: ${landed.error.message}`,
         { retryable: landed.error.retryable, cause },
+      );
+    }
+  }
+
+  async findExisting(req: SettlementRequest): Promise<Outcome<SettlementRef | undefined>> {
+    try {
+      const paymentsOutcome = await this.inspector.paymentsFrom(this.signer.publicKey);
+      if (!paymentsOutcome.ok) return paymentsOutcome;
+
+      const { bridge_asset, asset_issuer } = req.corridor.settlement;
+      const isXlm =
+        bridge_asset.toUpperCase() === "XLM" || bridge_asset.toLowerCase() === "native";
+
+      for (const p of paymentsOutcome.value) {
+        // Must be sent from our signing account
+        if (p.from !== this.signer.publicKey) continue;
+
+        // Destination match
+        if (p.to !== req.to) continue;
+
+        // Asset match
+        if (isXlm) {
+          if (p.asset_type !== "native" && p.asset_code?.toUpperCase() !== "XLM") continue;
+        } else {
+          if (p.asset_code?.toUpperCase() !== bridge_asset.toUpperCase()) continue;
+          if (asset_issuer && p.asset_issuer && p.asset_issuer !== asset_issuer) continue;
+        }
+
+        // Amount match using compareAmounts
+        const cmp = compareAmounts(p.amount, req.amount.amount);
+        if (!cmp.ok || cmp.value !== 0) continue;
+
+        // Memo match respecting type (hash vs text vs id)
+        if (!req.memo) {
+          if (p.memo && p.memo_type !== "none") continue;
+        } else {
+          const reqType = req.memoType ?? "text";
+          const pType = p.memo_type ?? "text";
+          if (reqType === "hash") {
+            if (pType !== "hash") continue;
+            const reqHex = normalizeHashMemo(req.memo);
+            const pHex = p.memo ? normalizeHashMemo(p.memo) : "";
+            if (reqHex !== pHex) continue;
+          } else if (reqType === "id") {
+            if (pType !== "id") continue;
+            if (p.memo !== req.memo) continue;
+          } else {
+            // text memo
+            if (pType !== "text" && pType !== undefined) continue;
+            if (p.memo !== req.memo) continue;
+          }
+        }
+
+        return ok<SettlementRef>({
+          stellarTxHash: p.transaction_hash,
+          ledger: p.ledger,
+        });
+      }
+
+      return ok(undefined);
+    } catch (err: unknown) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `failed to check for existing settlement: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err, retryable: true },
       );
     }
   }
@@ -281,13 +389,20 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
     );
   }
 
-  /** Poll Horizon until the tx is in a ledger or we time out. Returns the ledger. */
-  private async confirm(hash: string): Promise<Outcome<number>> {
+  /** Poll Horizon until the tx is in a ledger or we time out. Returns the ledger and feeCharged. */
+  private async confirm(
+    hash: string,
+  ): Promise<Outcome<{ ledger?: number; feeCharged?: string }>> {
     const deadline = this.now() + this.confirmTimeoutMs;
     for (;;) {
       try {
         const tx = await this.server.transactions().transaction(hash).call();
-        if (tx.successful) return ok(tx.ledger_attr ?? tx.ledger);
+        if (tx.successful) {
+          return ok({
+            ledger: tx.ledger_attr ?? tx.ledger,
+            feeCharged: tx.fee_charged != null ? tx.fee_charged.toString() : undefined,
+          });
+        }
         return fail("SETTLEMENT_FAILED", `tx ${hash} failed on-chain`);
       } catch {
         // not yet visible
@@ -302,6 +417,17 @@ export class StellarSettlementSubmitter implements SettlementSubmitter {
       }
       await this.sleep(1_000);
     }
+  }
+}
+
+function normalizeHashMemo(m: string): string {
+  if (/^[0-9a-fA-F]{64}$/.test(m)) {
+    return m.toLowerCase();
+  }
+  try {
+    return Buffer.from(m, "base64").toString("hex").toLowerCase();
+  } catch {
+    return m.toLowerCase();
   }
 }
 
@@ -338,6 +464,20 @@ function describe(cause: unknown): string {
 }
 
 // --- Account Inspector & Balance Gate Check -------------------------------
+
+export interface PaymentFact {
+  readonly id: string;
+  readonly transaction_hash: string;
+  readonly from: string;
+  readonly to: string;
+  readonly asset_type: string;
+  readonly asset_code?: string;
+  readonly asset_issuer?: string;
+  readonly amount: string;
+  readonly memo?: string;
+  readonly memo_type?: "text" | "hash" | "id" | "none" | "return" | string;
+  readonly ledger?: number;
+}
 
 export interface AccountBalanceFact {
   readonly asset_type: string;
@@ -382,19 +522,69 @@ export interface HorizonAccountResponseLike {
   readonly flags?: AccountFacts["flags"];
 }
 
+/** One operation of a settled transaction, as read back from Horizon. */
+export interface SettlementOperationFacts {
+  readonly type: string;
+  readonly to?: string;
+  readonly amount?: string;
+  readonly asset_type?: string;
+  readonly asset_code?: string;
+  readonly asset_issuer?: string;
+}
+
+/** What Horizon says a settlement transaction contains. */
+export interface SettlementFacts {
+  readonly hash: string;
+  readonly successful: boolean;
+  /** Horizon's representation: text as-is, id as decimal string, hash as base64. */
+  readonly memo?: string;
+  readonly memoType: string;
+  readonly operations: readonly SettlementOperationFacts[];
+}
+
+export interface HorizonPaymentTxLike {
+  readonly memo?: string;
+  readonly memo_type?: string;
+  readonly ledger_attr?: number;
+  readonly ledger?: number;
+}
+
+export interface HorizonPaymentRecordLike {
+  readonly id?: string;
+  readonly transaction_hash?: string;
+  readonly from?: string;
+  readonly source_account?: string;
+  readonly funder?: string;
+  readonly to?: string;
+  readonly account?: string;
+  readonly into?: string;
+  readonly asset_type?: string;
+  readonly asset_code?: string;
+  readonly asset_issuer?: string;
+  readonly amount?: string;
+  readonly starting_balance?: string;
+  readonly memo?: string;
+  readonly memo_type?: string;
+  readonly ledger?: number;
+  readonly transaction?: () => Promise<HorizonPaymentTxLike>;
+}
+
+export type AccountInspectorServerLike = Pick<Horizon.Server, "loadAccount"> &
+  Partial<Pick<Horizon.Server, "payments" | "transactions" | "operations">>;
+
 export interface AccountInspectorOptions {
   readonly horizonUrl?: string;
-  readonly horizonServer?: Pick<Horizon.Server, "loadAccount">;
+  readonly horizonServer?: AccountInspectorServerLike;
   readonly baseReserve?: string;
   readonly baseFee?: string;
 }
 
 /**
  * Read-only Horizon account inspector. Provides typed account facts,
- * balances, subentry counts, liabilities, and base reserve/fee.
+ * balances, subentry counts, liabilities, base reserve/fee, and payment history.
  */
 export class AccountInspector {
-  private readonly server: Pick<Horizon.Server, "loadAccount">;
+  private readonly server: AccountInspectorServerLike;
   private readonly defaultBaseReserve: string;
   private readonly defaultBaseFee: string;
 
@@ -447,6 +637,131 @@ export class AccountInspector {
     }
   }
 
+  async paymentsFrom(
+    accountId: string,
+    opts: { limit?: number } = {},
+  ): Promise<Outcome<PaymentFact[]>> {
+    try {
+      if (typeof this.server.payments !== "function") {
+        return ok([]);
+      }
+      const limit = opts.limit ?? 50;
+      const res = await this.server
+        .payments()
+        .forAccount(accountId)
+        .order("desc")
+        .limit(limit)
+        .call();
+
+      const records = (res.records ?? []) as unknown as HorizonPaymentRecordLike[];
+      const facts: PaymentFact[] = [];
+      for (const record of records) {
+        const from = record.from ?? record.source_account ?? record.funder;
+        const to = record.to ?? record.account ?? record.into;
+        if (!from || !to) continue;
+
+        let memo: string | undefined;
+        let memoType: string | undefined;
+        let ledger: number | undefined;
+
+        if (typeof record.transaction === "function") {
+          try {
+            const tx = (await record.transaction()) as unknown as HorizonPaymentTxLike;
+            memo = tx.memo;
+            memoType = tx.memo_type;
+            ledger = tx.ledger_attr ?? (typeof tx.ledger === "number" ? tx.ledger : undefined);
+          } catch {
+            // ignore lookup error
+          }
+        } else if (typeof this.server.transactions === "function" && record.transaction_hash) {
+          try {
+            const tx = (await this.server
+              .transactions()
+              .transaction(record.transaction_hash)
+              .call()) as unknown as HorizonPaymentTxLike;
+            memo = tx.memo;
+            memoType = tx.memo_type;
+            ledger = tx.ledger_attr ?? (typeof tx.ledger === "number" ? tx.ledger : undefined);
+          } catch {
+            // ignore lookup error
+          }
+        }
+
+        if (memo === undefined && record.memo !== undefined) {
+          memo = record.memo;
+        }
+        if (memoType === undefined && record.memo_type !== undefined) {
+          memoType = record.memo_type;
+        }
+        if (ledger === undefined && record.ledger !== undefined) {
+          ledger = record.ledger;
+        }
+
+        facts.push({
+          id: record.id ?? "",
+          transaction_hash: record.transaction_hash ?? "",
+          from,
+          to,
+          asset_type: record.asset_type ?? (record.asset_code ? "credit_alphanum4" : "native"),
+          asset_code: record.asset_code,
+          asset_issuer: record.asset_issuer,
+          amount: record.amount ?? record.starting_balance ?? "0",
+          memo,
+          memo_type: memoType,
+          ledger,
+        });
+      }
+      return ok(facts);
+    } catch (err: unknown) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `failed to load payments for account ${accountId}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err, retryable: true },
+      );
+    }
+  }
+
+  /** Read a transaction's operations, memo and memo type back from Horizon. */
+  async settlementFacts(hash: string): Promise<Outcome<SettlementFacts>> {
+    const server = this.server;
+    if (!server.transactions || !server.operations) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        "Horizon server does not expose transactions/operations",
+      );
+    }
+    try {
+      const tx = (await server.transactions().transaction(hash).call()) as {
+        successful: boolean;
+        memo?: string;
+        memo_type?: string;
+      };
+      const ops = (await server.operations().forTransaction(hash).limit(200).call()) as {
+        records: SettlementOperationFacts[];
+      };
+      return ok<SettlementFacts>({
+        hash,
+        successful: tx.successful,
+        memo: tx.memo,
+        memoType: tx.memo_type ?? "none",
+        operations: ops.records.map((o) => ({
+          type: o.type,
+          to: o.to,
+          amount: o.amount,
+          asset_type: o.asset_type,
+          asset_code: o.asset_code,
+          asset_issuer: o.asset_issuer,
+        })),
+      });
+    } catch (err: unknown) {
+      return fail(
+        "SETTLEMENT_FAILED",
+        `failed to read tx ${hash} from Horizon: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err, retryable: true },
+      );
+    }
+  }
+
   async baseReserve(): Promise<Outcome<string>> {
     return ok(this.defaultBaseReserve);
   }
@@ -454,6 +769,84 @@ export class AccountInspector {
   async baseFee(): Promise<Outcome<string>> {
     return ok(this.defaultBaseFee);
   }
+}
+
+function mismatch(
+  field: string,
+  expected: string,
+  actual: string | undefined,
+): Outcome<never> {
+  return fail(
+    "RECONCILE_MISMATCH",
+    `settlement tx does not match request: ${field} expected ${expected}, on-chain ${actual ?? "(none)"}`,
+    { retryable: false },
+  );
+}
+
+/**
+ * Assert a transaction contains exactly one operation and that it is a payment
+ * matching the request's destination, amount, asset and memo. Pure: no I/O.
+ */
+export function verifySettlementFacts(
+  facts: SettlementFacts,
+  req: SettlementRequest,
+): Outcome<void> {
+  if (!facts.successful) {
+    return fail("RECONCILE_MISMATCH", `settlement tx ${facts.hash} failed on-chain`, {
+      retryable: false,
+    });
+  }
+  if (facts.operations.length !== 1) {
+    return mismatch("operation count", "1", String(facts.operations.length));
+  }
+  const op = facts.operations[0] as SettlementOperationFacts;
+  if (op.type !== "payment") return mismatch("operation type", "payment", op.type);
+  if (op.to !== req.to) return mismatch("destination", req.to, op.to);
+
+  const cmp = compareAmounts(req.amount.amount, op.amount ?? "");
+  if (!cmp.ok || cmp.value !== 0) return mismatch("amount", req.amount.amount, op.amount);
+
+  const code = req.corridor.settlement.bridge_asset;
+  if (code.toUpperCase() === "XLM") {
+    if (op.asset_type !== "native") {
+      return mismatch("asset", "XLM (native)", `${op.asset_code ?? op.asset_type}`);
+    }
+  } else {
+    const issuer = req.corridor.settlement.asset_issuer;
+    if (op.asset_type === "native" || op.asset_code !== code || op.asset_issuer !== issuer) {
+      return mismatch(
+        "asset",
+        `${code}:${issuer}`,
+        op.asset_type === "native" ? "XLM (native)" : `${op.asset_code}:${op.asset_issuer}`,
+      );
+    }
+  }
+
+  // Memo: compare in one canonical form per type. A hash memo is base64 on both
+  // sides but may differ in padding/alphabet, so re-encode the request's memo.
+  const expectedType = req.memo ? (req.memoType ?? "text") : "none";
+  if (facts.memoType !== expectedType)
+    return mismatch("memo type", expectedType, facts.memoType);
+  if (req.memo) {
+    const expected =
+      expectedType === "hash" ? Buffer.from(req.memo, "base64").toString("base64") : req.memo;
+    if (facts.memo !== expected) return mismatch("memo", expected, facts.memo);
+  }
+  return ok(undefined);
+}
+
+/**
+ * Build the `EngineDeps.chainVerifier`: re-reads the settlement transaction
+ * from Horizon and asserts it paid what the run asked for.
+ */
+export function createChainVerifier(inspector: {
+  settlementFacts(hash: string): Promise<Outcome<SettlementFacts>>;
+}): ChainVerifier {
+  return async (ref, req) => {
+    const facts = await inspector.settlementFacts(ref.stellarTxHash);
+    if (!facts.ok) return facts;
+    return verifySettlementFacts(facts.value, req);
+  };
 }
 
 export type AccountInspectorLike =
@@ -733,3 +1126,171 @@ export function balanceCheck(
     },
   };
 }
+
+export interface DestinationCheckOptions {
+  /**
+   * Operator-supplied flagged-account hook. Deliberately a predicate, not a
+   * list: the operator decides where their denylist lives (config, DB, a
+   * sanctions feed) and this check never hard-codes or scrapes one.
+   */
+  readonly denylist?: (g: string) => boolean;
+}
+
+/**
+ * Gate check: the destination account must be able to receive the bridge
+ * asset BEFORE we build, sign and submit (#150). Without it, a missing
+ * account, absent trustline, or de-authorized trustline is only discovered
+ * as a Horizon rejection after signing — and `describe()` is how the
+ * operator finds out.
+ *
+ * Sub-checks, each named in the refusal detail:
+ * 1. `exists` — the account is on-chain.
+ * 2. `self-payment` — the destination is not our own signing account.
+ * 3. `denylist` — the operator's flagged-account hook does not match.
+ * 4. `trustline` — for a non-native bridge asset, a trustline for
+ *    `bridge_asset`/`asset_issuer` exists and `is_authorized` is true.
+ *    Native XLM needs no trustline, so it skips this sub-check.
+ *
+ * Refusal returns `PRESETTLE_DESTINATION_UNSAFE`.
+ */
+export function destinationCheck(
+  inspector: AccountInspectorLike,
+  signerPublicKey: string,
+  opts: DestinationCheckOptions = {},
+): GateCheck {
+  const NAME = "chain.destination";
+  return {
+    name: NAME,
+    async run(ctx: GateContext): Promise<CheckResult> {
+      const start = Date.now();
+      const done = (partial: Omit<CheckResult, "name" | "durationMs">): CheckResult => ({
+        name: NAME,
+        durationMs: Date.now() - start,
+        ...partial,
+      });
+      const destination = ctx.opened.depositAddress;
+
+      if (destination === signerPublicKey) {
+        return done({
+          passed: false,
+          code: "PRESETTLE_DESTINATION_UNSAFE",
+          detail: `self-payment: destination equals our signing account`,
+        });
+      }
+      if (opts.denylist?.(destination)) {
+        return done({
+          passed: false,
+          code: "PRESETTLE_DESTINATION_UNSAFE",
+          detail: `denylist: destination is operator-flagged`,
+        });
+      }
+
+      let facts: AccountFacts | undefined;
+      try {
+        if ("account" in inspector && typeof inspector.account === "function") {
+          const outcome = await inspector.account(destination);
+          if (!outcome.ok) {
+            return done({
+              passed: false,
+              code: "SETTLEMENT_FAILED",
+              detail: `failed to inspect destination: ${outcome.error.message}`,
+            });
+          }
+          facts = outcome.value;
+        } else if ("loadAccount" in inspector && typeof inspector.loadAccount === "function") {
+          const res = (await inspector.loadAccount(destination)) as HorizonAccountResponseLike;
+          facts = {
+            id: res.id ?? destination,
+            subentry_count: res.subentry_count ?? 0,
+            num_sponsoring: res.num_sponsoring ?? 0,
+            num_sponsored: res.num_sponsored ?? 0,
+            balances: (res.balances ?? []).map((b) => ({
+              asset_type: b.asset_type,
+              asset_code: b.asset_code,
+              asset_issuer: b.asset_issuer,
+              balance: b.balance,
+              selling_liabilities: b.selling_liabilities ?? "0",
+              buying_liabilities: b.buying_liabilities ?? "0",
+              is_authorized: b.is_authorized ?? true,
+            })),
+            flags: res.flags,
+          };
+        } else {
+          return done({
+            passed: false,
+            code: "SETTLEMENT_FAILED",
+            detail: "invalid AccountInspector instance",
+          });
+        }
+      } catch (err: unknown) {
+        const anyErr = err as {
+          response?: { status?: number };
+          status?: number;
+          message?: string;
+        };
+        if (
+          anyErr?.response?.status === 404 ||
+          anyErr?.status === 404 ||
+          /not found/i.test(anyErr?.message ?? "")
+        ) {
+          facts = undefined;
+        } else {
+          return done({
+            passed: false,
+            code: "SETTLEMENT_FAILED",
+            detail: `failed to inspect destination: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      }
+
+      if (!facts) {
+        return done({
+          passed: false,
+          code: "PRESETTLE_DESTINATION_UNSAFE",
+          detail: `exists: destination account is not on-chain`,
+        });
+      }
+
+      const bridgeAssetCode = ctx.corridor.settlement.bridge_asset;
+      const isXlmBridge =
+        bridgeAssetCode.toUpperCase() === "XLM" || bridgeAssetCode.toLowerCase() === "native";
+      if (isXlmBridge) {
+        return done({
+          passed: true,
+          detail: "destination exists; native bridge asset needs no trustline",
+        });
+      }
+
+      const bridgeAssetIssuer = ctx.corridor.settlement.asset_issuer;
+      const trustline = facts.balances.find((b) => {
+        if (b.asset_type === "native") return false;
+        if (b.asset_code?.toUpperCase() !== bridgeAssetCode.toUpperCase()) return false;
+        if (bridgeAssetIssuer && b.asset_issuer && b.asset_issuer !== bridgeAssetIssuer) {
+          return false;
+        }
+        return true;
+      });
+      if (!trustline) {
+        return done({
+          passed: false,
+          code: "PRESETTLE_DESTINATION_UNSAFE",
+          detail: `trustline: destination has no ${bridgeAssetCode} trustline`,
+        });
+      }
+      if (trustline.is_authorized === false) {
+        return done({
+          passed: false,
+          code: "PRESETTLE_DESTINATION_UNSAFE",
+          detail: `trustline: destination's ${bridgeAssetCode} trustline is not authorized`,
+        });
+      }
+
+      return done({
+        passed: true,
+        detail: `destination exists with an authorized ${bridgeAssetCode} trustline`,
+      });
+    },
+  };
+}
+
+export { tomlHashCheck, type TomlHashCheckOptions } from "./toml-hash-check";

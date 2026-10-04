@@ -26,12 +26,20 @@ function corridor(): Corridor {
       endpoints: {
         home_domain: "d.example",
         transfer_server_sep31: "https://d.example/sep31",
+        endpoints_verified_at: "1970-01-01",
       },
     },
     fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
     compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
     settlement: { network: "public", asset_issuer: "GISSUER" },
     recovery: {},
+    proof: {
+      canary_completed_at: "1970-01-01T00:00:00Z",
+      stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      anchor_transaction_id: "canary-test",
+      amount: "1",
+      max_age_days: 50000,
+    },
   });
   if (!r.ok) throw new Error("fixture invalid");
   return r.value;
@@ -173,9 +181,12 @@ function fakeDb(): Queryable & { table: Map<string, Record<string, unknown>> } {
         transaction_id: params[4],
         quote_id: params[5],
         stellar_tx_hash: params[6],
-        refund_id: params[7],
-        last_error: params[8],
-        owner: params[9],
+        deposit_address: params[7],
+        memo: params[8],
+        memo_type: params[9],
+        refund_id: params[10],
+        last_error: params[11],
+        owner: params[12],
       };
       // create(): INSERT … ON CONFLICT DO NOTHING RETURNING — only the first
       // writer for a key lands a row and gets it back; a conflict returns [].
@@ -314,6 +325,12 @@ describe("refund state round-trips", () => {
     });
     expect(seen[0]).toContain("refund_id");
     expect(seen.slice(1).join("\n")).toContain("add column if not exists refund_id");
+    expect(seen[0]).toContain("deposit_address");
+    expect(seen[0]).toContain("memo");
+    expect(seen[0]).toContain("memo_type");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists deposit_address");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo");
+    expect(seen.slice(1).join("\n")).toContain("add column if not exists memo_type");
   });
 });
 
@@ -333,6 +350,29 @@ describe("PostgresIdempotencyStore", () => {
     expect(got).toMatchObject({ idempotencyKey: "k", state: "settled", transactionId: "tx" });
     expect(got?.stellarTxHash).toBeUndefined();
     expect(got?.quoteId).toBeUndefined();
+    expect(got?.depositAddress).toBeUndefined();
+    expect(got?.memo).toBeUndefined();
+    expect(got?.memoType).toBeUndefined();
+  });
+
+  it("round-trips depositAddress, memo, and memoType", async () => {
+    const db = fakeDb();
+    const store = new PostgresIdempotencyStore(db);
+    const run: StoredRun = {
+      idempotencyKey: "k-dep",
+      corridorId: "c",
+      state: "opened",
+      version: 3,
+      transactionId: "tx-dep",
+      depositAddress: "GDEP123",
+      memo: "memo-test",
+      memoType: "text",
+    };
+    await store.put(run);
+    const got = await store.get("k-dep");
+    expect(got?.depositAddress).toBe("GDEP123");
+    expect(got?.memo).toBe("memo-test");
+    expect(got?.memoType).toBe("text");
   });
 
   it("ignores a stale write with a lower version (optimistic concurrency)", async () => {

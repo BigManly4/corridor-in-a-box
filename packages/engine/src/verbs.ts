@@ -4,7 +4,14 @@
 // right size while there's a single corridor exercising them.
 
 import type { Corridor } from "@corridor/manifest";
-import { fail, ok, type Outcome, type PaymentIntent } from "@corridor/types";
+import {
+  fail,
+  ok,
+  type Outcome,
+  type PaymentIntent,
+  isSettleableAmount,
+  STROOP_SCALE,
+} from "@corridor/types";
 import type {
   AnchorAdapter,
   KycResult,
@@ -60,6 +67,48 @@ export async function open(
   return adapter.openTransaction(intent, q, corridor);
 }
 
+/**
+ * The exact settlement request `settle()` submits, factored out (#148) so the
+ * `anchor.tx.match` gate check verifies the very request that will be built —
+ * not a parallel reconstruction that could drift from it.
+ */
+export function buildSettlementRequest(
+  opened: OpenTransaction,
+  q: Quote,
+  corridor: Corridor,
+): SettlementRequest {
+  return {
+    to: opened.depositAddress,
+    memo: opened.memo,
+    memoType: opened.memoType,
+    amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
+    corridor,
+    validUntil: q.firm ? q.expiresAt : undefined,
+  };
+}
+
+/**
+ * Why a quote must NOT be settled as-is, or null when it can be. `Quote.sourceAmount.asset` is the intent's
+ * asset, while the on-chain leg pays the corridor's bridge asset: that relabel is only legitimate when the two
+ * are the same asset, and the amount has to be exactly representable at 7 decimal places (stroops).
+ */
+export function settleQuoteProblem(q: Quote, corridor: Corridor): string | null {
+  const bridge = corridor.settlement.bridge_asset;
+  const sellAsset = q.sourceAmount.asset;
+  const isMatch =
+    sellAsset === bridge ||
+    sellAsset === `stellar:${bridge}:${corridor.settlement.asset_issuer}` ||
+    (bridge.toUpperCase() === "XLM" &&
+      (sellAsset === "native" || sellAsset === "stellar:native"));
+  if (!isMatch) {
+    return `quote source asset "${sellAsset}" does not match settlement bridge asset "${bridge}"`;
+  }
+  if (!isSettleableAmount(q.sourceAmount.amount, STROOP_SCALE)) {
+    return `settle amount "${q.sourceAmount.amount}" is not a valid settleable amount at ${STROOP_SCALE} decimal places`;
+  }
+  return null;
+}
+
 // 3b. SETTLE — the native on-chain payment of the bridge asset to the anchor.
 export async function settle(
   submitter: SettlementSubmitter,
@@ -67,14 +116,10 @@ export async function settle(
   q: Quote,
   corridor: Corridor,
 ): Promise<Outcome<SettlementRef>> {
-  const req: SettlementRequest = {
-    to: opened.depositAddress,
-    memo: opened.memo,
-    memoType: opened.memoType,
-    amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
-    corridor,
-  };
-  return submitter.submit(req);
+  // Refuse before anything is submitted: never relabel an asset or round an amount silently.
+  const problem = settleQuoteProblem(q, corridor);
+  if (problem) return fail("AMOUNT_INVALID", problem);
+  return submitter.submit(buildSettlementRequest(opened, q, corridor));
 }
 
 // 4. RECONCILE — match the on-chain leg against the anchor's view of the payout.
@@ -104,7 +149,8 @@ export interface PollOptions {
   pollMs: number;
   /**
    * Number of consecutive polls returning the same status before we conclude
-   * the anchor is stuck rather than legitimately slow. Once crossed,
+   * the anchor is stuck rather than legitimately slow. External phases use
+   * `externalStallMs` instead. Once crossed,
    * `reconcileUntil` returns a non-retryable `RECONCILE_STALLED` carrying the
    * stuck status and the consecutive count.
    *
@@ -118,6 +164,8 @@ export interface PollOptions {
    * transitioning through intermediate states won't be misdiagnosed.
    */
   stallThreshold?: number;
+  /** Maximum elapsed time in an external phase before declaring a stall. */
+  externalStallMs?: number;
   /** Corridor ID for metric tagging. Optional. */
   corridorId?: string;
   /** Logger for per-poll debug logs. Optional. */
@@ -145,9 +193,13 @@ export async function reconcileUntil(
   // Omitted or 0 disables stall detection at this layer; execute() applies the
   // production default of 10 one level up (run.ts) and passes it down.
   const threshold = opts.stallThreshold ?? 0;
+  const externalStallMs = opts.externalStallMs ?? 6 * 60 * 60 * 1000;
   let poll = 0;
   const startedAt = opts.now();
   let lastAwaitingInput = false;
+  let lastPhase: TransactionStatus["phase"];
+  let externalStartedAt: number | undefined;
+  let nextPollMs = opts.pollMs;
   for (;;) {
     poll += 1;
     const s = await adapter.getTransaction(transactionId);
@@ -171,11 +223,20 @@ export async function reconcileUntil(
     // first/last pair readable as a stalled observer.
     if (s.ok) {
       if (firstStatus === undefined) firstStatus = s.value.status;
+      const statusChanged = s.value.status !== lastStatus;
       // A status identical to the previous poll's is what a stuck observer
       // looks like; any change resets the run of sameness.
       sameCount = s.value.status === lastStatus ? sameCount + 1 : 0;
       lastStatus = s.value.status;
       lastAwaitingInput = s.value.awaitingInput === true;
+      lastPhase = s.value.phase;
+      if (lastPhase === "external") {
+        if (externalStartedAt === undefined) externalStartedAt = opts.now();
+        if (statusChanged) nextPollMs = opts.pollMs;
+      } else {
+        externalStartedAt = undefined;
+        nextPollMs = opts.pollMs;
+      }
     }
     if (s.ok && s.value.settled) return s;
     // A terminal non-success at the anchor (error/expired/refunded): stop polling
@@ -185,13 +246,29 @@ export async function reconcileUntil(
       return fail(
         "RECONCILE_MISMATCH",
         `tx ${transactionId} terminally failed at anchor (status=${s.value.status})`,
+        // The full terminal status rides along so the engine can read `status`
+        // and `refunds` without a second poll. See `anchorTerminalStatus`.
+        { retryable: false, cause: s.value },
+      );
+    }
+    if (
+      lastPhase === "external" &&
+      externalStartedAt !== undefined &&
+      opts.now() - externalStartedAt >= externalStallMs
+    ) {
+      const externalElapsedMs = opts.now() - externalStartedAt;
+      return fail(
+        "RECONCILE_STALLED",
+        `tx ${transactionId} exhausted external stall budget at status=${lastStatus} ` +
+          `(elapsed=${externalElapsedMs}ms, budget=${externalStallMs}ms)`,
         { retryable: false },
       );
     }
-    if (threshold > 0 && sameCount >= threshold) {
+    if (lastPhase !== "external" && threshold > 0 && sameCount >= threshold) {
       return fail(
         "RECONCILE_STALLED",
-        `tx ${transactionId} stuck at status=${lastStatus} for ${sameCount} consecutive polls`,
+        `tx ${transactionId} exhausted poll stall budget at status=${lastStatus} ` +
+          `for ${sameCount} consecutive polls (budget=${threshold} polls)`,
         { retryable: false },
       );
     }
@@ -208,8 +285,102 @@ export async function reconcileUntil(
         { retryable: false },
       );
     }
+    const delay =
+      lastPhase === "external"
+        ? Math.min(nextPollMs, Math.max(opts.pollMs, 60_000))
+        : opts.pollMs;
+    await opts.sleep(delay);
+    nextPollMs =
+      lastPhase === "external"
+        ? Math.min(delay * 2, Math.max(opts.pollMs, 60_000))
+        : opts.pollMs;
+  }
+}
+
+export interface RefundPollOptions {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  /** Absolute epoch-ms after which the anchor refund wait is held. */
+  deadlineMs: number;
+  pollMs: number;
+  corridorId?: string;
+  logger?: Logger;
+  metrics?: Metrics;
+}
+
+/**
+ * Watch the receiving anchor's transaction record for the refund it owns.
+ * SEP-31 reports refunds asynchronously on the transaction; the sending side
+ * must not attempt a second, unilateral reversal while that report is pending.
+ */
+export async function watchRefund(
+  adapter: AnchorAdapter,
+  transactionId: string,
+  opts: RefundPollOptions,
+): Promise<Outcome<TransactionStatus>> {
+  let poll = 0;
+  const startedAt = opts.now();
+  for (;;) {
+    poll += 1;
+    const result = await adapter.getTransaction(transactionId);
+    const status = result.ok ? result.value.status : "error";
+    const elapsedMs = opts.now() - startedAt;
+    opts.logger?.log("debug", "corridor.refund.poll", {
+      transactionId,
+      status,
+      poll,
+      elapsedMs,
+    });
+    opts.metrics?.increment("corridor.refund.poll", {
+      ...(opts.corridorId ? { corridor: opts.corridorId } : {}),
+      status,
+    });
+
+    // SEP-31 reports the refund on the transaction record: either as a
+    // `refunded` status or alongside a terminal failure (`error`/`expired`).
+    if (
+      result.ok &&
+      result.value.refunds &&
+      (result.value.status === "refunded" || result.value.terminalFailure === true)
+    ) {
+      const refund = result.value.refunds;
+      if (refund.completeness === "full") return result;
+      return fail("RECONCILE_MISMATCH", refundMessage(transactionId, refund), {
+        retryable: false,
+        cause: result.value,
+      });
+    }
+    if (opts.now() >= opts.deadlineMs) {
+      return fail(
+        "SETTLEMENT_TIMEOUT",
+        `refund for tx ${transactionId} was not fully reported before timeout (polls=${poll}, elapsed=${elapsedMs}ms)`,
+        { retryable: false, cause: result.ok ? result.value : result.error },
+      );
+    }
     await opts.sleep(opts.pollMs);
   }
+}
+
+function refundMessage(
+  transactionId: string,
+  refund: NonNullable<TransactionStatus["refunds"]>,
+): string {
+  return `refund for tx ${transactionId} is ${refund.completeness}: amountRefunded=${refund.amountRefunded.amount} ${refund.amountRefunded.asset}, amountFee=${refund.amountFee.amount} ${refund.amountFee.asset}`;
+}
+
+/**
+ * The anchor's terminal `TransactionStatus`, when `reconcileUntil` failed because
+ * the anchor reported a terminal non-success state (carried on the error's
+ * `cause`). Undefined for every other failure (timeout, stall, transport).
+ */
+export function anchorTerminalStatus(e: { cause?: unknown }): TransactionStatus | undefined {
+  const c = e.cause as Partial<TransactionStatus> | undefined;
+  return c &&
+    typeof c === "object" &&
+    c.terminalFailure === true &&
+    typeof c.status === "string"
+    ? (c as TransactionStatus)
+    : undefined;
 }
 
 /** Exponential backoff with a cap, used between settlement retries. */

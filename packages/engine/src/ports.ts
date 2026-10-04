@@ -13,6 +13,8 @@ import { fail, ok, type Money, type Outcome } from "@corridor/types";
 export interface SettlementRef {
   readonly stellarTxHash: string;
   readonly ledger?: number;
+  /** Network fee actually charged, in stroops, as Horizon's `fee_charged` reports it. */
+  readonly feeCharged?: string;
 }
 
 export interface SettlementRequest {
@@ -23,6 +25,8 @@ export interface SettlementRequest {
   readonly memoType?: "text" | "hash" | "id";
   readonly amount: Money;
   readonly corridor: Corridor;
+  /** Epoch ms after which a firm quote expires and settlement must not land on-chain. */
+  readonly validUntil?: number;
 }
 
 export interface RefundRequest {
@@ -33,7 +37,27 @@ export interface RefundRequest {
   readonly reason: string;
 }
 
+/**
+ * Independent post-settle check that the transaction the submitter reported
+ * really contains the payment we asked for (destination, amount, asset, memo).
+ * The engine otherwise trusts the submitter's hash and the anchor's `completed`
+ * status. Optional: pass it on `EngineDeps.chainVerifier` to turn it on.
+ *
+ * Return a non-retryable `RECONCILE_MISMATCH` naming the differing field when
+ * the chain disagrees with the request.
+ */
+export type ChainVerifier = (
+  ref: SettlementRef,
+  req: SettlementRequest,
+) => Promise<Outcome<void>>;
+
 export interface SettlementSubmitter {
+  /**
+   * Check whether a matching settlement payment already exists on-chain before
+   * submitting or re-submitting. Returns the existing ref if found, or undefined
+   * if no matching payment exists.
+   */
+  findExisting?(req: SettlementRequest): Promise<Outcome<SettlementRef | undefined>>;
   submit(req: SettlementRequest): Promise<Outcome<SettlementRef>>;
   /**
    * Reverse a previously-submitted settlement (send the bridge asset back).
@@ -72,11 +96,17 @@ export class UnimplementedSubmitter implements SettlementSubmitter {
 }
 
 /** Test/example submitter: pretends the on-chain payment succeeded. */
-export function createMockSubmitter(opts: { failSubmit?: boolean } = {}): SettlementSubmitter {
+export function createMockSubmitter(
+  opts: { failSubmit?: boolean; existingRef?: SettlementRef } = {},
+): SettlementSubmitter {
   let n = 0;
   const hash = (prefix: string) =>
     `${prefix}${(++n).toString().padStart(64 - prefix.length, "0")}`;
   return {
+    async findExisting(req) {
+      void req;
+      return ok<SettlementRef | undefined>(opts.existingRef);
+    },
     async submit(req) {
       void req;
       if (opts.failSubmit) {

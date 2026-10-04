@@ -18,6 +18,7 @@ export interface Quote {
   readonly expiresAt: number;
   readonly sourceAmount: Money;
   readonly destAmount: Money;
+  readonly fee?: Money;
   readonly firm: boolean;
 }
 
@@ -90,6 +91,8 @@ export interface RefundInfo {
 export interface TransactionStatus {
   /** The raw status string reported by the anchor (e.g. a SEP-31 status). */
   readonly status: string;
+  /** The subsystem currently responsible for making progress on this status. */
+  readonly phase?: "anchor" | "external";
   /** The payout is confirmed complete — the engine may finish. */
   readonly settled: boolean;
   /**
