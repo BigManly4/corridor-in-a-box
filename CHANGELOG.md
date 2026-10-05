@@ -7,6 +7,37 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added — `fx.quote_source: external` path (#190)
+
+- `ExternalQuoteProvider` and `EngineDeps.externalQuote`: operators inject a
+  pricing function for corridors with no SEP-38 server. Quotes are `firm: false`;
+  no SEP-38 call is made. `external` + `who_holds_risk: receiving_anchor` is
+  refused before `open` unless the adapter reports `native` quotes.
+- Minimal shim for #187/#189: `AdapterCapabilities` and `AnchorAdapter.capabilities()`
+  (implemented by `Sep31Adapter` and the mock, which takes `capabilities` overrides)
+  and the `QuoteProvider` interface. `capabilities()` is now required on
+  `AnchorAdapter`, a breaking change for out-of-tree adapters.
+
+### Added — `AccountInspector` reads live reserve/fee and our payment history (2026-09-30)
+
+`AccountInspector` in `@corridor/stellar` is now the one read-only Horizon
+seam every chain-facing check reuses
+([#149](https://github.com/ezedike-evan/corridor-in-a-box/issues/149)):
+
+- `baseReserve()` and `baseFee()` read the latest ledger (stroops converted
+  with BigInt, never floats) instead of returning constants. The
+  `baseReserve`/`baseFee` constructor options still pin a value.
+- New `paymentsFrom(source, { to?, sinceLedger? })` returns our outgoing
+  payments, newest first, each joined with its transaction's memo and memo type.
+  It reads at most `maxPages` pages and reports `truncated` when it stopped
+  early, so a duplicate-send check can tell "not found" from "didn't look".
+- The constructor takes a narrowed, structural `InspectorHorizonLike` fake;
+  a real `Horizon.Server` satisfies it without a cast.
+- A trustline whose authorization Horizon doesn't report now reads as
+  `is_authorized: false` (was `true`). Only a 404 / `NotFoundError` means
+  "account does not exist"; an error whose message merely says "not found"
+  is now a retryable failure.
+
 ### Added — verify the settle payment on-chain before reconcile
 
 - New optional `EngineDeps.chainVerifier`. After `settled` (and on resume from
@@ -106,6 +137,20 @@ Added 9 dedicated pre-settle gate and circuit breaker error codes to `CorridorEr
 - `CORRIDOR_HALTED` — per-corridor circuit breaker is open
 
 Added helper `isPreSettleCode(code): boolean` in `@corridor/types` and mapped the error codes in `@corridor/service` HTTP router.
+
+### Added — `TransactionStatus` carries the anchor's expected amount, deposit account and memo (2026-09-26)
+
+`Sep31Adapter.getTransaction` read only `status`, `amount_in`,
+`amount_in_asset` and `refunds` off `GET /transactions/:id`, so the opened
+transaction could not be cross-checked against the payment about to be sent.
+
+`TransactionStatus` now has optional `amountIn` (`Money`), `depositAddress`,
+`memo` and `memoType`, parsed from `amount_in`/`amount_in_asset`,
+`stellar_account_id`, `stellar_memo` and `stellar_memo_type`. As with
+`refunds`, each is read on its own and anything malformed — including a numeric
+`amount_in` — is omitted, never guessed; status classification is unchanged.
+`createMockAdapter` reports back what each opened transaction was given. The
+change is additive: other adapters may leave the fields undefined.
 
 ### Changed — web/ migrated to Next.js 16 and TypeScript 7 (#85) (2026-09-02)
 
@@ -224,6 +269,12 @@ contract itself rejected the attestation, the error carries its number as
 `examples/attest.ts` now checks `contractError === AttesterContractError.TooSoon`.
 The error `code` and message text are unchanged, so existing callers keep
 working.
+
+### Breaking — Pre-settle gate mandatory by default with explicit named opt-out (2026-09-25)
+
+The pre-settle gate is now mandatory before settlement execution. In `EngineDeps`, callers must supply either `gate: PreSettleGate` (e.g. `defaultSep31Gate()`) or explicitly opt out with `unsafeSkipPreSettleGate: true`. If neither is provided, `execute()` fails fast immediately with error code `ENGINE_MISCONFIGURED` before claiming the idempotency key (ensuring no run row is persisted).
+
+When opted out via `unsafeSkipPreSettleGate: true`, the engine passes through the `verifying` state, emits a warning log, and records a synthetic `gate.skipped` check on the transition audit entry. The `CompositeGate` runs checks concurrently, fail-closed, recording results on the `AuditEntry` and incrementing the `corridor.gate.check` metric.
 
 ### Added — `verifying` state between `opened` and `settling` (2026-09-25)
 
