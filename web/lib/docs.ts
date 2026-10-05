@@ -55,7 +55,7 @@ pnpm cli plan corridors/reference.corridor.yaml   # offline liveness check
 \`pnpm example\` walks a payment through every state and proves idempotency:
 
 \`\`\`
-created -> quoted -> compliant -> opened -> settling -> settled -> reconciled -> completed
+created -> quoted -> compliant -> opened -> verifying -> settling -> settled -> reconciled -> completed
 replay with same key -> idempotent return (state=completed)
 \`\`\`
 
@@ -87,8 +87,6 @@ packages/
   stellar/       the only money-path package that touches the chain:
                  settlement submitter + SEP-10 signer
   router/        RouteResolver seam — open interface + static default
-  stellar/       the ONLY chain-touching package: settlement submitter + SEP-10 signer
-  router/        RouteResolver seam — open interface + two resolvers (Static + Registry)
   engine/        orchestration: state machine, crash-resume, recovery, audit, metrics
   service/       thin HTTP API over the engine (auth + rate limiting)
   cli/           validate a manifest; print an offline runnability plan
@@ -115,7 +113,7 @@ registry; they never move funds.
 ## The state machine
 
 A persisted state machine drives \`created → quoted → compliant → opened →
-settling → settled → reconciled → completed\`. Every transition is logged,
+verifying → settling → settled → reconciled → completed\`. Every transition is logged,
 audited, and counted. The full table, from \`packages/engine/src/state.ts\`:
 
 | State | Possible next states |
@@ -123,9 +121,10 @@ audited, and counted. The full table, from \`packages/engine/src/state.ts\`:
 | \`created\` | \`quoted\`, \`failed\` |
 | \`quoted\` | \`compliant\`, \`recovering\`, \`failed\` |
 | \`compliant\` | \`opened\`, \`recovering\`, \`failed\` |
-| \`opened\` | \`settling\`, \`recovering\`, \`failed\` |
+| \`opened\` | \`verifying\`, \`recovering\`, \`failed\` |
+| \`verifying\` | \`settling\`, \`failed\` |
 | \`settling\` | \`settled\`, \`retrying\`, \`recovering\`, \`failed\` |
-| \`retrying\` | \`settling\`, \`recovering\`, \`failed\` |
+| \`retrying\` | \`verifying\`, \`recovering\`, \`failed\` |
 | \`settled\` | \`reconciled\`, \`recovering\`, \`failed\` |
 | \`reconciled\` | \`completed\`, \`failed\` |
 | \`recovering\` | \`refund_pending\`, \`refunded\`, \`held\`, \`failed\` |
@@ -136,7 +135,7 @@ audited, and counted. The full table, from \`packages/engine/src/state.ts\`:
 | \`failed\` | terminal |
 
 \`retrying\` is entered only when a settle attempt failed before money moved,
-and is the only state that may re-enter \`settling\`. \`recovering\` and
+and is the only state that may re-enter \`verifying\`. \`recovering\` and
 \`refund_pending\` can be entered after settlement, so neither can reach
 \`settling\` — a double-spend is unreachable by construction.
 `,
